@@ -1,6 +1,8 @@
 ## v0.8.2-beta
 
 - 增加了一些插件。
+- 修复istore插件安装后无法打开的问题。
+
 ## v0.8.1-beta
 
 - 修复 2.5G 版升级时误报 invalid sysupgrade file 的问题。
