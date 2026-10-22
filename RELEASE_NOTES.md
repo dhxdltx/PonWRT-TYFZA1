@@ -1,3 +1,7 @@
+## v0.8.10-BETA-CUSTOM
+
+- 增加了一些组件。filebrowser和openssl.
+
 ## v0.8.2-beta
 
 - 增加了一些插件。
