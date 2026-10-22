@@ -37,8 +37,10 @@ ln -sfn "$ARGON" "$TREE/package/luci-theme-argon"
 sed -i 's/+curl +tar +libuci-lua/+curl +libuci-lua/' \
     feeds/istore/luci/luci-app-store/Makefile
 
-# Install iStore packages from the new feed.
-./scripts/feeds install -p istore luci-app-store
+./scripts/feeds update packages luci istore
+# PONWRT 已经通过 BusyBox 提供 tar，不需要独立 tar 包
+sed -i 's/+curl +tar +libuci-lua/+curl +libuci-lua/' \
+    feeds/istore/luci/luci-app-store/Makefile
 sh "$P/port/scripts/apply-luci-patches.sh" "$TREE"
 printf '%s\n' "$PACKAGES" | xargs ./scripts/feeds install cgi-io luasrcdiet luci
 # Existing build trees retain .config; select the new default there as well.
