@@ -1,3 +1,6 @@
+## v0.8.2-beta
+
+- 增加了一些插件。
 ## v0.8.1-beta
 
 - 修复 2.5G 版升级时误报 invalid sysupgrade file 的问题。
