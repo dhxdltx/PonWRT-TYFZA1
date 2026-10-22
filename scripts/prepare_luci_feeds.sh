@@ -32,6 +32,13 @@ if [ -e "$TREE/package/luci-theme-argon" ] && [ ! -L "$TREE/package/luci-theme-a
 fi
 ln -sfn "$ARGON" "$TREE/package/luci-theme-argon"
 ./scripts/feeds update packages luci istore
+
+# Remove the standalone tar dependency; BusyBox already provides tar.
+sed -i 's/+curl +tar +libuci-lua/+curl +libuci-lua/' \
+    feeds/istore/luci/luci-app-store/Makefile
+
+# Install iStore packages from the new feed.
+./scripts/feeds install -p istore luci-app-store
 sh "$P/port/scripts/apply-luci-patches.sh" "$TREE"
 printf '%s\n' "$PACKAGES" | xargs ./scripts/feeds install cgi-io luasrcdiet luci
 # Existing build trees retain .config; select the new default there as well.
