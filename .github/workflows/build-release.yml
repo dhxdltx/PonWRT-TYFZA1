@@ -109,17 +109,6 @@ jobs:
           openssl req -new -x509 -key artifacts/signing/dev.key \
             -out artifacts/signing/dev.crt -subj /CN=TYFZA1-FIT -days 3650
 
-      - name: Add iStore feed
-        run: |
-          echo 'src-git istore https://github.com/linkease/istore;main' >> feeds.conf.default
-          ./scripts/feeds update istore
-
-          # PONWRT 使用 BusyBox 提供 tar，移除不存在的独立 tar 依赖
-          sed -i 's/+curl +tar +libuci-lua/+curl +libuci-lua/' \
-            feeds/istore/luci/luci-app-store/Makefile
-
-          ./scripts/feeds install -d y -p istore luci-app-store
-
       - name: Build OpenWrt and native PE
         shell: bash
         env:
