@@ -8,6 +8,7 @@ struct packed_word { u32 value; } __attribute__((packed));
 #define REQUEST_BASE 0x4000
 #define MAILBOX_OFFSET 0x2000
 #include "rx-geometry.h"
+#include <linux/rtl9617c-qm-layout.h>
 
 static inline void sync(void) { __asm__ volatile("sync" ::: "memory"); }
 static inline void *uncached(u32 address) { return (void *)(address | 0xa0000000U); }
@@ -22,7 +23,7 @@ static void unaligned_word(u8 *out, u32 value)
 }
 
 #ifdef PE_UPLINK
-static u32 mac_equal(const u8 *a, const u8 *b)
+static u32 __attribute__((section(".entry"), noinline)) mac_equal(const u8 *a, const u8 *b)
 {
 	return ((const struct packed_word *)a)->value == ((const struct packed_word *)b)->value &&
 		a[4] == b[4] && a[5] == b[5];
@@ -48,7 +49,7 @@ static u32 ni_length(const u32 *entry, u32 buffer, u32 *head)
 	/* Stock compact EPP already supplies length; HEADER_A is not needed. */
 	u32 epp = entry[1];
 	if ((epp >> 14) & 63) { *head = 16; return (epp & 0x3fff) - 16; }
-	const u32 *data = uncached(buffer + 32);
+	const u32 *data = uncached(buffer + RTL_QM_HEADROOM);
 	u32 extra = data[0] & 128 ? 8 : 0, raw = data[1];
 	*head = 8 + extra;
 	/* Extract the network-order field without a full MIPS32 byte swap. */
@@ -80,7 +81,7 @@ static void pe_event(volatile u32 *mailbox)
 	mailbox[67]++;
 }
 
-static void pe_event_flush(volatile u32 *mailbox)
+static void __attribute__((section(".entry"), noinline)) pe_event_flush(volatile u32 *mailbox)
 {
 	if (!mailbox[64]) return;
 	if (mailbox[69] != mailbox[66] || mailbox[69] == mailbox[67]) return;
@@ -106,6 +107,17 @@ static void ni_buffered_event(volatile u32 *mailbox, u32 buffered)
 
 #endif
 
+static void __attribute__((section(".entry"), noinline)) rpq_event(volatile u32 *mailbox)
+{
+#ifdef PE_UPLINK
+	/* PE0 publishes reports; PE1 owns the shared ARM notification timer. */
+	sync();
+	mailbox[RTL_AX_RPQ_EVENT_WRITE]++;
+#else
+	pe_event(mailbox);
+#endif
+}
+
 static void pe_rpq(volatile u32 *mailbox, u8 *memory)
 {
 	if (!mailbox[68]) return;
@@ -120,6 +132,7 @@ static void pe_rpq(volatile u32 *mailbox, u8 *memory)
 	u32 offset = 4 + (wd & BIT(31) ? 32 : 16) + ((wd >> 14) & 3) * 2 + ((wd >> 28) & 7) * 16;
 	if ((wd & BIT(23)) && type != 1) offset += 4;
 	u32 written = info & 0x3fff, forwarded = 0, completed = mailbox[75];
+	u32 completion_start = mailbox[45], completion_write = completion_start;
 	u32 old = rtl_ax_rx_epoch_old(&mailbox[RTL_AX_PE_DFS_EPOCH + 1], consumer);
 	u8 *out = uncached(mailbox[72] + producer * RTL_AX_RPQ_BUFFER_BYTES);
 	if ((info & 0xc000) != 0xc000 || written > RTL_AX_RPQ_BUFFER_BYTES || offset > written || bytes > written - offset) {
@@ -159,16 +172,21 @@ static void pe_rpq(volatile u32 *mailbox, u8 *memory)
 				unaligned_word(out + offset + forwarded, report); forwarded += 4;
 			}
 			owners[member * 2 + 1] = details | BIT(31) | status;
-			*(u32 *)(memory + 0xc800 + mailbox[45] * 4) = member;
-			mailbox[45] = (mailbox[45] + 1) & 127;
+			*(u32 *)(memory + 0xc800 + completion_write * 4) = member;
+			completion_write = (completion_write + 1) & 127;
 			mailbox[75]++; mailbox[76] += !!(status || (report & BIT(31)));
 		}
 		if (forwarded) {
 			word(out + 4, (wd & ~0x3fffU) | forwarded);
 			sync();
 			mailbox[73] = (producer + 1) & 255;
-			if (producer == mailbox[74]) pe_event(mailbox);
+			if (producer == mailbox[74]) rpq_event(mailbox);
 		}
+	}
+	if (completion_write != completion_start) {
+		/* The PE1 recycler acquires this producer before reading WP owners. */
+		sync();
+		mailbox[45] = completion_write;
 	}
 	buffer[0] = 0;
 	mailbox[70] = (consumer + 1) & 255;
@@ -177,7 +195,7 @@ static void pe_rpq(volatile u32 *mailbox, u8 *memory)
 	*(volatile u16 *)((u8 *)bar + 0x121c) = mailbox[70];
 	bar[0x10b4 / 4] = BIT(2);
 	/* A peer/key waiter needs its completion even while other peers keep TX busy. */
-	if (mailbox[78] && mailbox[75] != completed) pe_event(mailbox);
+	if (mailbox[78] && mailbox[75] != completed) rpq_event(mailbox);
 }
 
 #ifdef PE_UPLINK
@@ -259,6 +277,7 @@ static void ni_recycle(volatile u32 *mailbox, u8 *memory)
 void pe_main(volatile u32 *control)
 {
 	u32 slot = 1;
+	u32 contexts[2] = {}, generations[2] = {}, commands[2] = {};
 #ifdef PE_UPLINK
 	u32 rx_poll[2] = {};
 #endif
@@ -276,9 +295,15 @@ void pe_main(volatile u32 *control)
 	for (;;) {
 		slot ^= 1;
 		u32 generation = control[142 + slot];
-		sync();
-		u32 context = control[140 + slot];
-		control[144 + slot] = generation;
+		/* Only a generation change publishes or withdraws a context. */
+		if (generation != generations[slot]) {
+			sync();
+			contexts[slot] = control[140 + slot];
+			generations[slot] = generation;
+			commands[slot] = 0;
+			control[144 + slot] = generation;
+		}
+		u32 context = contexts[slot];
 		if (!context) continue;
 		volatile u32 *mailbox = (void *)context;
 		u8 *memory = (u8 *)mailbox - MAILBOX_OFFSET;
@@ -289,6 +314,12 @@ void pe_main(volatile u32 *control)
 			sync(); mailbox[0] = 0x50455744;
 		}
 		u32 command = mailbox[3];
+		if (command != commands[slot]) {
+			/* Complete the previous turn before acknowledging a pause. */
+			sync();
+			mailbox[4] = command;
+			commands[slot] = command;
+		}
 		u32 ni_packet = 0;
 #ifndef PE_UPLINK
 		u32 ni_buffer = 0;
@@ -300,27 +331,41 @@ void pe_main(volatile u32 *control)
 		volatile u32 *owners = (void *)(memory + 0xc400);
 #endif
 		if (!(command & 1)) {
-			/* ARM may release the event timer as soon as pause is acknowledged. */
-			sync();
-			mailbox[4] = command;
 			continue;
 		}
-		mailbox[4] = command;
-		pe_event_flush(mailbox);
-		pe_rpq(mailbox, memory);
 #ifdef PE_UPLINK
-		/* An unready DMA tag cannot have committed a new frame. Keep the
-		 * producer check for ready frames and poll RDU every16 idle turns. */
-		if (mailbox[80] && (mailbox[RTL_AX_RX_WORK_READ] != mailbox[RTL_AX_RX_WORK_WRITE] ||
-		    ((*(volatile u32 *)uncached(rx_buffer_dma(mailbox,
-		        *(u32 *)(memory + RTL_AX_RX_SLOT_MAP + mailbox[81] * 4))) >> 16) & 8191) ==
-		        (mailbox[82] == 8191 ? 1 : mailbox[82] + 1) || !(++rx_poll[slot] & 15)))
+		if (mailbox[187]) {
+			u8 *tx_memory = uncached(mailbox[187]);
+			pe_rpq((void *)(tx_memory + MAILBOX_OFFSET), tx_memory);
+		}
+#else
+		pe_rpq(mailbox, memory);
 #endif
+#ifdef PE_UPLINK
+		/* Keep ready RX batches moving and revisit idle DMA every16 turns. */
+		if (mailbox[80]) {
+			if (mailbox[RTL_AX_RX_WORK_READ] != mailbox[RTL_AX_RX_WORK_WRITE] ||
+			    ((*(volatile u32 *)uncached(rx_buffer_dma(mailbox,
+			        *(u32 *)(memory + RTL_AX_RX_SLOT_MAP + mailbox[81] * 4))) >> 16) & 8191) ==
+			        (mailbox[82] == 8191 ? 1 : mailbox[82] + 1) || !(++rx_poll[slot] & 15))
+				pe_rxq_batch(mailbox);
+			continue;
+		}
+		u32 reports = mailbox[RTL_AX_RPQ_EVENT_WRITE];
+		if (reports != mailbox[RTL_AX_RPQ_EVENT_READ]) {
+			sync();
+			mailbox[RTL_AX_RPQ_EVENT_READ] = reports;
+			pe_event(mailbox);
+		}
+		pe_rx_backend(mailbox);
+#else
 		for (u32 budget = 0; budget < 16; budget++) {
 			u32 before = mailbox[81] | mailbox[RTL_AX_RX_WORK_PROCESS] << 8;
 			pe_rxq(mailbox);
 			if ((mailbox[81] | mailbox[RTL_AX_RX_WORK_PROCESS] << 8) == before) break;
 		}
+#endif
+		pe_event_flush(mailbox);
 		if (mailbox[30]) ni_recycle(mailbox, memory);
 		sync();
 		/* Stock phl_handle_pending_wd publishes a completed TXBD batch.
@@ -356,7 +401,7 @@ void pe_main(volatile u32 *control)
 				ni_buffer = entry[0] & 0xffffff80;
 				u32 header, length = ni_length(entry, ni_buffer, &header);
 				/* One EPP owns one 2 KiB BID; never gather past that DMA allocation. */
-				if (retired || (entry[0] & 0x50) != 0x50 || length < 14 || length > 2048 - 32 - header) {
+				if (retired || (entry[0] & 0x50) != 0x50 || length < 14 || length > RTL_QM_DATA_BYTES - header) {
 					owners[id * 2] = ni_buffer;
 					owners[id * 2 + 1] = BIT(31);
 					*(u32 *)uncached(ni_buffer) = 0;
@@ -388,7 +433,7 @@ void pe_main(volatile u32 *control)
 				}
 				ni_request[2] = (ni_request[2] & 0x3f0000) | BIT(24) |
 					(length + ((ni_request[2] >> 16) & 63) + 8 - 14);
-				ni_request[8] = ni_buffer + 32 + header;
+				ni_request[8] = ni_buffer + RTL_QM_HEADROOM + header;
 				ni_request[9] = length;
 				owners[id * 2] = ni_buffer;
 				owners[id * 2 + 1] = (asleep ? BIT(16) : 0) | mailbox[27] << 8 |
@@ -400,11 +445,11 @@ void pe_main(volatile u32 *control)
 					u32 buffer2 = second[0] & 0xffffff80, head2;
 					u32 bytes2 = ni_length(second, buffer2, &head2);
 					u32 pad = (0U - length - 8) & 3;
-					if ((second[0] & 0x50) == 0x50 && bytes2 >= 14 && bytes2 <= 2048 - 32 - head2 &&
+					if ((second[0] & 0x50) == 0x50 && bytes2 >= 14 && bytes2 <= RTL_QM_DATA_BYTES - head2 &&
 					    length + bytes2 + 16 + pad <= (caps >> 18)) {
 						ni_request[4] |= BIT(21);
 						ni_request[2] = BIT(25) | 26U << 16 | (26 + length + bytes2 + 16 + pad);
-						ni_request[10] = buffer2 + 32 + head2;
+						ni_request[10] = buffer2 + RTL_QM_HEADROOM + head2;
 						ni_request[11] = bytes2;
 						*(u32 *)uncached(ni_buffer) = buffer2;
 						*(u32 *)uncached(buffer2) = 0;
@@ -432,6 +477,8 @@ void pe_main(volatile u32 *control)
 			u8 *txbd = uncached(mailbox[11] + (ring * 256 + slot) * 8);
 			u32 sequence = flags & 0xfff;
 
+			/* Keep fixed DMEM builders compact for the RX ordering code. */
+#pragma clang loop unroll(disable)
 			for (u32 i = 0; i < 128; i += 4) word(page + i, 0);
 			if (flags & BIT(22)) {
 				/* Original normal and shortcut TX share sta->txseq_tid[]. */
@@ -446,7 +493,7 @@ void pe_main(volatile u32 *control)
 				);
 				sequence = sequences[macid * 8 + tid];
 				sequences[macid * 8 + tid] = (sequence + 1) & 0xfff;
-				header_copy(header, uncached(request[8]), header_bytes);
+				header_copy(header, uncached(mailbox[14] + id * 128), header_bytes);
 				header[22] = sequence << 4;
 				header[23] = sequence >> 4;
 				address(page + used, mailbox[14] + id * 128, header_bytes, 0);
@@ -455,7 +502,7 @@ void pe_main(volatile u32 *control)
 			if (flags & BIT(18)) {
 				u32 macid = flags >> 24, tid = flags & 7;
 				u32 header_bytes = (packet >> 16) & 63;
-				const struct packed_word *input = uncached(request[8]);
+				const struct packed_word *input = uncached(ni_packet ? request[8] : mailbox[14] + id * 128);
 				/* Gather addresses once; byte assembly belongs in private DMEM. */
 				u32 ethernet_words[4] = {input[0].value, input[1].value,
 					input[2].value, ((const u8 *)input)[12] | (u32)((const u8 *)input)[13] << 8};
@@ -475,6 +522,7 @@ void pe_main(volatile u32 *control)
 				header[0] = header_bytes == 26 ? 0x88 : 0x08;
 				header[1] = 0x02 | protected << 6 | (flags & BIT(19) ? 0x20 : 0);
 				header[2] = header[3] = 0;
+#pragma clang loop unroll(disable)
 				for (u32 i = 0; i < 6; i++) {
 					header[4 + i] = ethernet[i];
 					header[10 + i] = ap_address[i];
@@ -566,7 +614,8 @@ void pe_main(volatile u32 *control)
 			word(page + 40, dw10);
 			if (flags & BIT(17)) {
 				u16 checksum = 0;
-				for (u32 i = 0; i < 56; i += 2) checksum ^= page[i] | (u16)page[i + 1] << 8;
+#pragma clang loop unroll(disable)
+				for (u32 i = 0; i < 14; i++) checksum ^= page_words[i] ^ (page_words[i] >> 16);
 				page[16] = checksum; page[17] = checksum >> 8;
 			}
 			word(page + 56, 0x8000 | id | ((flags & BIT(12)) ? BIT(14) : 0));
@@ -588,12 +637,14 @@ void pe_main(volatile u32 *control)
 				mailbox[9] = consumer;
 			}
 			mailbox[10]++;
+			mailbox[RTL_AX_PE_TX_BYTES] += packet & 0x3fff;
 			mailbox[1]++;
 			mailbox[13] = id;
 		}
 	publish_tx:
 		if (publish) {
 			sync();
+#pragma clang loop unroll(disable)
 			for (u32 ring = 0; ring < 6; ring++)
 				if (publish & BIT(ring)) *(volatile u16 *)(mailbox[2] + indices[ring]) = producers[ring];
 			sync();

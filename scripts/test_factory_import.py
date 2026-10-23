@@ -34,7 +34,9 @@ def invoke(script, case, values, bosa, identity=True, reset=True):
     (source / 'config_hs.xml').write_text('<Config>\n' + '\n'.join(
         f'<Value Name="{key}" Value="{value}"/>' for key, value in values.items()) + '\n</Config>\n')
     config = source / 'config.xml'
-    if identity:
+    if isinstance(identity, str):
+        config.write_text(identity)
+    elif identity:
         config.write_text('<Config><chain chainName="EPON_LLID_TBL">'
             '<Value Name="macAddr" Value="021122334456"/></chain></Config>\n')
     else:
@@ -73,6 +75,21 @@ for family, speed, mode in (('1', '0', 'gpon'), ('1', '1', 'xgpon'),
     assert f"option mode '{mode}'" in (imported / 'var/run/tyfza1-factory/pon_factory').read_text()
 print('Factory protocol: all six OEM family/speed mappings imported')
 
+# The 2.5G factory XG-PON configuration has no EPON LLID MAC.
+for family, speed, mode in (('1', '0', 'gpon'), ('1', '1', 'xgpon'), ('1', '2', 'xgspon'), ('2', '1', 'epon-d10g')):
+    values = dict(fields, PON_MODE=family, PON_SPEED=speed, PON_SUB_MODE='0')
+    for config in ('<Config><chain chainName="EPON_LLID_TBL"></chain></Config>', '<Config/>'):
+        result, data, imported = invoke('factory.uc', 'empty-epon-' + mode, values, valid_bosa, config)
+        assert result.returncode == (1 if family == '2' else 0), result.stderr
+        assert data == expected
+        identity_text = (imported / 'var/run/tyfza1-factory/pon_factory').read_text()
+        assert "option serial_number 'TEST12345678'" in identity_text
+        assert 'option onu_mac' not in identity_text
+bad_mac = '<Config><chain chainName="EPON_LLID_TBL"><Value Name="macAddr" Value="bad"/></chain></Config>'
+result, _, _ = invoke('factory.uc', 'invalid-epon-mac', dict(fields, PON_MODE='1', PON_SUB_MODE='0'), valid_bosa, bad_mac)
+assert result.returncode != 0
+print('ITU empty EPON table accepted; EPON missing identity and malformed supplied MAC rejected')
+
 for case, bosa, identity in (('short-bosa', b'bad', True), ('extended-bosa', valid_bosa + b'original suffix', True),
                              ('missing-bosa', None, True), ('missing-pon-config', valid_bosa, False)):
     result, data, destination = invoke('factory.uc', case, fields, bosa, identity)
@@ -109,6 +126,8 @@ importer = runtime / 'usr/share/tyfza1/factory.uc'
 importer.parent.mkdir(parents=True, exist_ok=True)
 shutil.copy2(project / 'port/packages/tyfza1-pon-control/files/factory.uc', importer)
 importer.chmod(0o755)
+shutil.copy2(project / 'port/packages/tyfza1-storage/files/tyfza1-factory.sh',
+             runtime / 'lib/tyfza1-factory.sh')
 (runtime / 'sys/class/ubi/ubi0').mkdir(parents=True, exist_ok=True)
 pon_mac = runtime / 'sys/bus/platform/devices/4f5500000.pon/data_mac'
 pon_mac.parent.mkdir(parents=True, exist_ok=True)
@@ -119,22 +138,37 @@ for port in range(1, 6):
 invoke('factory.uc', 'boot-input', fields, valid_bosa)
 calibrations = ['rtl9617c/bosa-calibration.bin'] + [
     f'tyfza1/{name}/flash-calibration.bin' for name in ('rtl8852ce', 'rtl8192xbe')]
+# Run the package's actual link installation recipe before boot. The links
+# must belong to the image; boot may only write the per-unit data in tmpfs.
+package = (project / 'port/packages/tyfza1-pon-control/Makefile').read_text()
+install = package.split('define Package/tyfza1-pon-control/install\n', 1)[1].split('endef', 1)[0]
+link_recipe = ''.join(line + '\n' for line in install.splitlines() if '/lib/firmware/' in line)
+assert link_recipe, 'Package must install the calibration links'
+recipe = runtime / 'calibration-links.mk'
+recipe.write_text('INSTALL_DIR:=mkdir -p\nLN:=ln -sf\ndefine install\n' + link_recipe +
+                  'endef\n.PHONY: install\ninstall:\n\t$(call install,' + str(runtime) + ')\n')
+subprocess.run(['make', '--no-print-directory', '-f', str(recipe), 'install'], check=True)
 for calibration in calibrations:
     link = runtime / 'lib/firmware/realtek' / calibration
-    link.parent.mkdir(parents=True, exist_ok=True)
-    link.unlink(missing_ok=True)
-    link.write_bytes(b'old persistent calibration')
+    assert link.is_symlink() and os.readlink(link) == '/tmp/tyfza1-factory/' + calibration
 
-def boot(mount_ok):
+def boot(mount_ok, readonly=False):
     script = ('. /etc/init.d/tyfza1-factory\n'
               'mount() { ' + ('cp /input/* "$6"/;' if mount_ok else 'return 5;') + ' }\n'
               'umount() { :; }\n'
               'ip() { echo "$*" >> /tmp/factory-lan-mac.log; }\n'
               ': > /tmp/factory-lan-mac.log\nstart\n')
-    return subprocess.run(['sudo', '-n', 'chroot', f'--userspec={os.getuid()}:{os.getgid()}',
-                           str(runtime), '/bin/sh', '-c', script], text=True, capture_output=True)
+    command = ['chroot', f'--userspec={os.getuid()}:{os.getgid()}',
+               str(runtime), '/bin/sh', '-c', script]
+    if readonly:
+        command = ['unshare', '--mount', '--propagation', 'private', '/bin/sh', '-c',
+                   'mount --bind "$1/lib/firmware" "$1/lib/firmware" && '
+                   'mount -o remount,bind,ro "$1/lib/firmware" && '
+                   'exec chroot --userspec="$2" "$1" /bin/sh -c "$3"',
+                   'factory-test', str(runtime), f'{os.getuid()}:{os.getgid()}', script]
+    return subprocess.run(['sudo', '-n', *command], text=True, capture_output=True)
 
-result = boot(True)
+result = boot(True, readonly=True)
 assert result.returncode == 0, (result.stdout, result.stderr)
 assert pon_mac.read_text() == '00:11:22:33:44:ff\n'
 assert (runtime / 'tmp/factory-lan-mac.log').read_text().splitlines() == [
@@ -145,10 +179,10 @@ for calibration, data in zip(calibrations, [valid_bosa] + expected):
     assert (runtime / 'tmp/tyfza1-factory' / calibration).read_bytes() == data
 result = boot(False)
 assert result.returncode == 5, (result.stdout, result.stderr)
-assert not (runtime / 'var/run/tyfza1-factory/pon_factory').exists()
+assert not (runtime / 'tmp/run/tyfza1-factory/pon_factory').exists()
 for calibration in calibrations:
     result = subprocess.run(['sudo', '-n', 'chroot', f'--userspec={os.getuid()}:{os.getgid()}',
         str(runtime), '/bin/cat', '/lib/firmware/realtek/' + calibration], capture_output=True)
     assert result.returncode != 0 and not result.stdout
-print('Boot service: persistent copies migrated to tmpfs links; mount failure makes every calibration unavailable')
+print('Boot service: package-owned links work on a read-only firmware directory; mount failure revokes calibration')
 print('Factory importer: original bytes, subsystem isolation and stale calibration removal passed')

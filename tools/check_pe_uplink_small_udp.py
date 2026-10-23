@@ -44,7 +44,7 @@ def case(directory, slot, ipv6, payload_bytes, fe_ready=True):
     base, states, buf, descriptors = 0x04000000, 0x05000000, 0x06000000, 0x06100000
     mb, vp = base + 0x2000, 0x13001100 + (9 + slot) * 0xa0
     u = Uc(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN)
-    for at, size in [(0x1fc00000, 0x4000), (base, 0x20000), (states, 0x20000),
+    for at, size in [(0x1fc00000, 0x10000), (base, 0x20000), (states, 0x20000),
                      (buf, 0x4000), (descriptors, 0x1000), (0x13000000, 0x2000),
                      (0x10000000, 0x10000)]:
         u.mem_map(at, size)
@@ -53,7 +53,7 @@ def case(directory, slot, ipv6, payload_bytes, fe_ready=True):
     get = lambda at: struct.unpack('<I', u.mem_read(at, 4))[0]
     put(0x10002300, (1 << 31 | 1 << 13) if fe_ready else 1 << 31)
     put(0x100038c4, 0xa0000000 if fe_ready else 0)
-    peer, ap, dst = bytes.fromhex('02000000004e'), bytes.fromhex('020000000042'), bytes.fromhex('020000000065')
+    peer, ap, dst = bytes.fromhex('067afb78b287'), bytes.fromhex('02e04c076805'), bytes.fromhex('0050c2010200')
     u.mem_write(mb + 64, ap)
     u.mem_write(base + 0xe410, peer)
     put(base + 0x11a08, 1)
@@ -71,10 +71,10 @@ def case(directory, slot, ipv6, payload_bytes, fe_ready=True):
     u.mem_write(buf, bytes(raw))
     for reg, value in [(UC_MIPS_REG_A0, mb | 0xa0000000), (UC_MIPS_REG_A1, buf | 0xa0000000),
                        (UC_MIPS_REG_A2, buf), (UC_MIPS_REG_SP, (base + 0x17ff0) | 0xa0000000),
-                       (UC_MIPS_REG_RA, 0xbfc03ff0)]:
+                       (UC_MIPS_REG_RA, 0x9fc0fff0)]:
         u.reg_write(reg, value)
-    u.emu_start(entry, 0xbfc03ff0, count=100000)
-    assert u.reg_read(UC_MIPS_REG_PC) == 0xbfc03ff0
+    u.emu_start(entry, 0x9fc0fff0, count=100000)
+    assert u.reg_read(UC_MIPS_REG_PC) == 0x9fc0fff0
     result = u.reg_read(UC_MIPS_REG_V0)
     if result:
         addr, info = get(descriptors), get(descriptors + 4)

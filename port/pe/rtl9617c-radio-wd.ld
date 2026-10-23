@@ -13,6 +13,9 @@ SECTIONS
     ASSERT(. <= 0xbfc02000, "PE code overlaps mailbox")
     . = 0xbfc02400;
     .rxq : { *(.rxq) }
-    /DISCARD/ : { *(.MIPS.abiflags) *(.reginfo) *(.pdr) *(.comment) *(.note*) }
+    /* The -G0, -mno-abicalls, -fno-pic image has no GOT users. */
+    /DISCARD/ : { *(.MIPS.abiflags) *(.reginfo) *(.pdr) *(.comment) *(.note*) *(.got) }
 }
-ASSERT(. <= 0xbfc04000, "PE code overlaps request ring")
+/* Code is loaded into the dedicated engine allocation. Per-radio request
+ * rings use separate allocations; the existing IMEM window is 32KiB. */
+ASSERT(. <= 0xbfc08000, "PE code exceeds instruction memory")

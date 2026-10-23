@@ -74,6 +74,10 @@ static void rtl_ax_monitor_stop(struct ieee80211_hw *hw, bool suspend)
 	WRITE_ONCE(radio->monitor_started, false);
 	rtl_ax_update32(&radio->io, 0xce40, BIT(0), 0);
 	tasklet_kill(&radio->tx_tasklet);
+	/* NI owns a netdev reference. Withdraw and drain it while RX/RPQ
+	 * can still complete, before unregister waits for that reference. */
+	ret = rtl_ax_tx_ni_route(radio->tx, NULL, 0);
+	if (ret) dev_err(&radio->pdev->dev, "NI withdrawal on radio stop failed: %d\n", ret);
 	rtl_ax_update32(&radio->io, 0xc400, BIT(12), 0);
 	radio->beacon_enabled = false;
 	ret = rtl_ax_tx_pause(radio->tx);
@@ -365,6 +369,8 @@ static int rtl_ax_rx_ba_remove(struct rtl_ax_ap *radio, unsigned int index)
 	ret = rtl_ax_command(radio, RTL_AX_H2C_CMD, 1, 12, 0, ba, sizeof(ba), true);
 	radio->rx_ba_result = ret;
 	if (!ret) {
+		rtl_ax_rx_ba_window(radio->rx, radio->rx_ba[index].macid,
+			radio->rx_ba[index].tid, 0);
 		radio->rx_ba[index].valid = false;
 		radio->rx_ba[index].deleting = false;
 		radio->rx_ba_stopped++;
@@ -736,8 +742,7 @@ static int rtl_ax_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 			wiphy_delayed_work_queue(hw->wiphy, &radio->cleanup_work, HZ);
 		return 0;
 	case IEEE80211_AMPDU_RX_START:
-		/* Stock BA replacement revokes its cached reorder state before reuse. */
-		ret = rtl_ax_tx_ni_retire_peer(radio->tx, station->macid);
+		ret = rtl_ax_tx_rx_retire(radio->tx, station->macid);
 		if (ret) return ret;
 		for (i = 0; i < ARRAY_SIZE(radio->rx_ba); i++)
 			if (radio->rx_ba[i].valid && radio->rx_ba[i].macid == station->macid &&
@@ -768,11 +773,13 @@ static int rtl_ax_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 		}
 		radio->rx_ba[i].deleting = false;
 		radio->rx_ba_started++;
+		rtl_ax_rx_ba_window(radio->rx, station->macid, params->tid, params->buf_size);
+		rtl_ax_offload_ready(radio);
 		dev_info(&radio->pdev->dev, "native RX BA MACID%u TID%u entry%u SSN%u FW completed\n",
 			station->macid, params->tid, i + 8, params->ssn);
 		return 0;
 	case IEEE80211_AMPDU_RX_STOP:
-		ret = rtl_ax_tx_ni_retire_peer(radio->tx, station->macid);
+		ret = rtl_ax_tx_rx_retire(radio->tx, station->macid);
 		if (ret) return ret;
 		for (i = 0; i < ARRAY_SIZE(radio->rx_ba); i++)
 			if (radio->rx_ba[i].valid && radio->rx_ba[i].macid == station->macid &&
@@ -787,6 +794,7 @@ static int rtl_ax_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 		}
 		dev_info(&radio->pdev->dev, "native RX BA MACID%u TID%u entry%u removed\n",
 			station->macid, params->tid, i + 8);
+		rtl_ax_offload_ready(radio);
 		return 0;
 	}
 	return -EOPNOTSUPP;
@@ -1096,6 +1104,8 @@ static void rtl_ax_link_sta_rc_update(struct ieee80211_hw *hw, struct ieee80211_
 static void rtl_ax_dm_work(struct wiphy *wiphy, struct wiphy_work *work)
 {
 	struct rtl_ax_ap *radio = container_of(work, struct rtl_ax_ap, dm_work.work);
+	struct rtl_ax_environment *env = &radio->environment;
+	unsigned long flags;
 
 	if (!radio->monitor_started) return;
 	/* Wiphy work shares start/stop/STA serialization; command_mutex
@@ -1105,6 +1115,26 @@ static void rtl_ax_dm_work(struct wiphy *wiphy, struct wiphy_work *work)
 		radio->chip, &radio->rf_runtime);
 	if (radio->rf_runtime.result)
 		dev_err(&radio->pdev->dev, "RF watchdog failed: %d\n", radio->rf_runtime.result);
+	if (radio->chip == RTL_AX_8852C && radio->channel.configured) {
+		u32 traffic = rtl_ax_tx_traffic_bytes(radio->tx) + rtl_ax_rx_traffic_bytes(radio->rx);
+		u64 now = ktime_get_boottime_ns() / 1000000;
+
+		if (env->background_started) {
+			rtl_ax_environment_sample(&radio->io, env, radio->channel.bandwidth);
+			env->throughput = div_u64((u64)(u32)(traffic - env->traffic_previous) * 8,
+				(now - env->traffic_time_ms) * 1000);
+		}
+		rtl_ax_environment_false_alarms(&radio->io, env);
+		spin_lock_irqsave(&radio->command_lock, flags);
+		if (radio->dfs.enabled)
+			rtl_ax_dfs_dynamic(&radio->dfs, env->throughput,
+				env->nhm_idle_ratio, env->nhm_noise_ratio, env->false_alarms);
+		spin_unlock_irqrestore(&radio->command_lock, flags);
+		env->traffic_previous = traffic;
+		env->traffic_time_ms = now;
+		rtl_ax_environment_trigger(&radio->io, env,
+			rtl_ax_environment_loss(radio->channel.external_loss[0], radio->channel.external_loss[1]));
+	}
 	mutex_unlock(&radio->command_mutex);
 	wiphy_delayed_work_queue(wiphy, &radio->dm_work, 2 * HZ);
 }
@@ -1275,10 +1305,13 @@ static int rtl_ax_monitor_receive(struct rtl_ax_ap *radio,
 		return -EOPNOTSUPP;
 	if ((rate >> 7) == 3 && gi_ltf >= ARRAY_SIZE(he_gi))
 		return -EOPNOTSUPP;
-	skb = dev_alloc_skb(packet->bytes);
-	if (!skb)
-		return -ENOMEM;
-	skb_put_data(skb, packet->payload, packet->bytes);
+	/* RXQ passes its DMA-backed skb. RPQ storage remains a bounded copy. */
+	skb = packet->skb;
+	if (!skb) {
+		skb = dev_alloc_skb(packet->bytes);
+		if (!skb) return -ENOMEM;
+		skb_put_data(skb, packet->payload, packet->bytes);
+	}
 	status = IEEE80211_SKB_RXCB(skb);
 	memset(status, 0, sizeof(*status));
 	status->flag = RX_FLAG_NO_SIGNAL_VAL;
@@ -1288,7 +1321,7 @@ static int rtl_ax_monitor_receive(struct rtl_ax_ap *radio,
 	word = rtl_ax_ap_read32(packet->descriptor + 12);
 	if ((word & BIT(2)) && !(word & BIT(1))) {
 		if (packet->icv_error) {
-			dev_kfree_skb(skb);
+			if (!packet->skb) dev_kfree_skb(skb);
 			return -EBADMSG;
 		}
 		status->flag |= RX_FLAG_DECRYPTED;
@@ -1329,7 +1362,7 @@ static int rtl_ax_monitor_receive(struct rtl_ax_ap *radio,
 	radio->mac80211_packets++;
 	if (profile) {
 		delivered = ktime_get_ns();
-		radio->rx_copy_bytes += packet->bytes;
+		if (!packet->skb) radio->rx_copy_bytes += packet->bytes;
 		radio->rx_prepare_ns += delivered - begin;
 	}
 	/* RX dispatch runs in rtl_ax_rx_work, not the hardware IRQ. Process
@@ -1417,6 +1450,7 @@ static int rtl_ax_monitor_register(struct rtl_ax_ap *radio)
 	hw->wiphy->reg_notifier = rtl_ax_regulatory_notify;
 	hw->sta_data_size = sizeof(struct rtl_ax_station);
 	ieee80211_hw_set(hw, RX_INCLUDES_FCS);
+	ieee80211_hw_set(hw, RX_INLINE);
 	/* mac80211 handles BIP and SW_MGMT_TX; RX retains the CCMP IV/MIC. */
 	ieee80211_hw_set(hw, MFP_CAPABLE);
 	ieee80211_hw_set(hw, AMPDU_AGGREGATION);
@@ -1451,7 +1485,8 @@ static int rtl_ax_monitor_register(struct rtl_ax_ap *radio)
 	radio->band.n_bitrates = ARRAY_SIZE(rates) - first_rate;
 	/* Both board radios implement the original 2T2R HT20/40 channel path. */
 	radio->band.ht_cap.ht_supported = true;
-	radio->band.ht_cap.cap = IEEE80211_HT_CAP_SGI_20 | IEEE80211_HT_CAP_MAX_AMSDU |
+	radio->band.ht_cap.cap = IEEE80211_HT_CAP_LDPC_CODING |
+		IEEE80211_HT_CAP_SGI_20 | IEEE80211_HT_CAP_MAX_AMSDU |
 		IEEE80211_HT_CAP_SUP_WIDTH_20_40 | IEEE80211_HT_CAP_SGI_40;
 	radio->band.ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
 	radio->band.ht_cap.mcs.rx_mask[0] = 0xff;
@@ -1461,7 +1496,8 @@ static int rtl_ax_monitor_register(struct rtl_ax_ap *radio)
 	if (radio->chip == RTL_AX_8852C) {
 		radio->band.vht_cap.vht_supported = true;
 		/* RMAC accepts 11966-byte MPDUs; native RXQ slots hold 12288 bytes. */
-		radio->band.vht_cap.cap = IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ |
+		radio->band.vht_cap.cap = IEEE80211_VHT_CAP_RXLDPC |
+			IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ |
 			IEEE80211_VHT_CAP_SHORT_GI_160 | IEEE80211_VHT_CAP_SHORT_GI_80 | IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_11454 |
 			(IEEE80211_VHT_MAX_AMPDU_1024K << IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT);
 		/* Two streams MCS0..9; all higher NSS are unsupported. */

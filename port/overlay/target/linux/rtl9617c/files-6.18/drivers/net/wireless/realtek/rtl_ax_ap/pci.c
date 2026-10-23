@@ -358,7 +358,7 @@ static int rtl_ax_receive(void *ctx, const struct rtl_ax_rx_packet *packet)
 
 		spin_lock_irqsave(&radio->command_lock, flags);
 		if (dfs->enabled && !dfs->detected) {
-			if (packet->bytes < 8 || (packet->bytes - 8) % 8) {
+			if (packet->bytes < 8 || packet->bytes > 8 + 61 * 8 || (packet->bytes - 8) % 8) {
 				dfs->malformed++;
 				spin_unlock_irqrestore(&radio->command_lock, flags);
 				return -EINVAL;
@@ -366,7 +366,7 @@ static int rtl_ax_receive(void *ctx, const struct rtl_ax_rx_packet *packet)
 			dfs->reports++;
 			dfs->pulses_seen += (packet->bytes - 8) / 8;
 			dfs->dropped += get_unaligned_le16(packet->payload);
-			detected = rtl_ax_dfs_detect(dfs, packet->payload + 8,
+			detected = rtl_ax_dfs_report(dfs, packet->payload + 8,
 				(packet->bytes - 8) / 8, ktime_get_boottime_seconds());
 			if (detected) {
 				dfs->detected = true;
@@ -386,10 +386,14 @@ static int rtl_ax_receive(void *ctx, const struct rtl_ax_rx_packet *packet)
 	if (packet->type == 1) {
 		struct rtl_ax_phy_signal signals[8];
 		unsigned int i;
+		u8 aci;
+		int aci_report;
 
 		if (!(rtl_ax_ap_read32(packet->descriptor) & BIT(23))) return 0;
 		ret = rtl_ax_ppdu_signal(packet->payload, packet->bytes, signals);
+		aci_report = rtl_ax_ppdu_aci(packet->payload, packet->bytes, &aci);
 		spin_lock_irqsave(&radio->command_lock, flags);
+		if (aci_report > 0) rtl_ax_dfs_aci(&radio->dfs, aci);
 		radio->ra_ppdu_reports++;
 		radio->ra_last_ppdu_bytes = packet->bytes;
 		memcpy(radio->ra_last_ppdu, packet->payload, min_t(unsigned int, packet->bytes, 64));
@@ -1491,6 +1495,12 @@ static ssize_t radio_dfs_show(struct device *dev,
 		length += sysfs_emit_at(buffer, length, "type=%u PW=%u..%u PRI=%u..%u pulses=%u\n",
 			i, dfs->profile.pw_min[i], dfs->profile.pw_max[i],
 			dfs->profile.pri_min[i], dfs->profile.pri_max[i], dfs->profile.pulses[i]);
+	length += sysfs_emit_at(buffer, length,
+		"dynamic=%u PW_factor=%u PRI_factor=%u PW_diff=%u PRI_diff=%u chirp_diff=%u "
+		"adaptive=%u count=%u total=%u ACI=%d ACI_pending=%u ACI_wait=%u\n",
+		dfs->dynamic_setting, dfs->pw_factor, dfs->pri_factor, dfs->pw_diff,
+		dfs->pri_diff, dfs->long_chirp_diff, dfs->adaptive_state,
+		dfs->adaptive_count, dfs->adaptive_total, dfs->aci, dfs->aci_pending, dfs->aci_wait);
 	return length;
 }
 static DEVICE_ATTR_RO(radio_dfs);
@@ -1553,10 +1563,25 @@ static ssize_t radio_environment_show(struct device *dev,
 	unsigned int i;
 	ssize_t length = sysfs_emit(buffer, "initialization=%s CCX_unit=%u CLM_input=%u "
 		"NHM_include_CCA=%u threshold_last_NHM_FAHM=%u,%u "
-		"measurement_trigger=pending report_collection=pending\n",
+		"NHM_trigger=%s NHM_report=%s\n",
 		environment->initialized ? "applied" : "pending", environment->ccx_unit,
 		environment->clm_input, environment->nhm_include_cca,
-		environment->nhm_threshold[10], environment->fahm_threshold[10]);
+		environment->nhm_threshold[10], environment->fahm_threshold[10],
+		environment->background_started ? "running" : "pending",
+		environment->nhm_ready ? "ready" : "not-ready");
+	length += sysfs_emit_at(buffer, length,
+		"NHM_samples=%llu not_ready=%llu period=%u TX=%u CCA=%u idle=%u "
+		"idle_ratio=%u noise_ratio=%u false_alarms=%u throughput_Mbps=%u RX_loss=%d\n",
+		environment->samples, environment->not_ready, environment->nhm_period,
+		environment->nhm_tx, environment->nhm_cca, environment->nhm_idle,
+		environment->nhm_idle_ratio, environment->nhm_noise_ratio,
+		environment->false_alarms, environment->throughput, environment->external_loss);
+	length += sysfs_emit_at(buffer, length,
+		"NHM_raw_bins=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+		environment->nhm_bins[0], environment->nhm_bins[1], environment->nhm_bins[2],
+		environment->nhm_bins[3], environment->nhm_bins[4], environment->nhm_bins[5],
+		environment->nhm_bins[6], environment->nhm_bins[7], environment->nhm_bins[8],
+		environment->nhm_bins[9], environment->nhm_bins[10], environment->nhm_bins[11]);
 
 	for (i = 0; i < ARRAY_SIZE(rtl_ax_environment_start); i++) {
 		const struct rtl_ax_environment_write *write = &rtl_ax_environment_start[i];
@@ -1686,6 +1711,21 @@ static int rtl_ax_dfs_start_locked(struct rtl_ax_ap *radio)
 		return -EOPNOTSUPP;
 	rtl_ax_dfs_initialize(dfs, region);
 	rtl_ax_dfs_channel(dfs, region, radio->channel.primary, radio->channel.bandwidth);
+	/* TW segment0 is the lower80, including when the primary is in the
+	 * upper80 (factory MKK36..64 policy). Classifier region does not decide
+	 * which frequencies require detection: use the actual channel flags. */
+	if (dfs->two_segments) {
+		bool lower_radar = false;
+
+		for (unsigned int i = 0; i < 4; i++) {
+			unsigned int channel = radio->channel.center - 14 + i * 4;
+			int frequency = ieee80211_channel_to_frequency(channel, NL80211_BAND_5GHZ);
+			struct ieee80211_channel *lower = ieee80211_get_channel(radio->hw->wiphy, frequency);
+
+			lower_radar |= !!(lower->flags & IEEE80211_CHAN_RADAR);
+		}
+		dfs->bypass_segment0 = !lower_radar;
+	}
 	dfs->in_cac = !radio->ap_started;
 	ret = rtl_ax_dfs_hardware(&radio->io, true);
 	if (ret) return ret;
@@ -2404,20 +2444,7 @@ static ssize_t radio_pe_route_store(struct device *dev,
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(radio_pe_route);
-static ssize_t radio_pe_uplink_store(struct device *dev,
-	struct device_attribute *attribute, const char *buffer, size_t count)
-{
-	struct rtl_ax_ap *radio = dev_get_drvdata(dev);
-	unsigned int macid, wifi_id = 0;
-	int ret;
-	if (sscanf(buffer, "%u %u", &macid, &wifi_id) < 1) return -EINVAL;
-	if (!radio->ap_vif) return -ENODEV;
-	wiphy_lock(radio->hw->wiphy);
-	ret = rtl_ax_tx_uplink(radio->tx, ieee80211_vif_to_wdev(radio->ap_vif)->netdev, macid, wifi_id);
-	wiphy_unlock(radio->hw->wiphy);
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_WO(radio_pe_uplink);
+
 static ssize_t radio_role_show(struct device *dev,
 	struct device_attribute *attribute, char *buffer)
 {
@@ -2571,7 +2598,6 @@ static ssize_t radio_port_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(radio_port);
 static struct attribute *rtl_ax_attrs[] = {
-	&dev_attr_radio_pe_uplink.attr,
 	&dev_attr_radio_pn.attr,
 	&dev_attr_radio_pe_ni_test.attr,
 	&dev_attr_radio_pe_route.attr,

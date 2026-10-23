@@ -20,6 +20,7 @@ def function(name):
 shim = r'''
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@ typedef unsigned char u8;
 #define ETH_ALEN 6
 #define ETH_DATA_LEN 1500
 #define BIT(n) (1U << (n))
+#define WRITE_ONCE(p,v) ((p)=(v))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define IS_ERR(p) ((intptr_t)(p)<0)
 #define PTR_ERR(p) ((int)(intptr_t)(p))
@@ -41,6 +43,18 @@ typedef unsigned char u8;
 #define dev_info(...) ((void)0)
 #define spin_lock_irqsave(l,f) ((f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(f))
+#define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
+struct work_struct {void (*func)(struct work_struct *);};
+struct completion {unsigned int done;};
+#define INIT_WORK(w,f) ((w)->func=(f))
+static struct work_struct *pending_work;
+static inline bool schedule_work(struct work_struct *w){pending_work=w;return true;}
+static inline void flush_work(struct work_struct *w){if(pending_work==w){pending_work=NULL;w->func(w);}}
+static int rtnl_held;
+static void rtnl_lock(void){assert(!rtnl_held);rtnl_held=1;}
+static void rtnl_unlock(void){assert(rtnl_held);rtnl_held=0;}
+#define init_completion(c) ((c)->done=0)
+#define complete_all(c) ((c)->done=~0U)
 struct device_node {unsigned int port;};
 struct device {struct device_node *of_node;};
 struct phy {int dummy;};
@@ -54,6 +68,8 @@ struct net_device {
 struct tyfza1_led {void *output;int requested;struct {char *name;int max_brightness;} cdev;};
 struct rtl_xram {
  struct net_device *netdev,*ports[5];unsigned int registered_ports,port;
+ struct work_struct lan4_work;struct completion lan4_ready;
+ struct device *lan4_parent;struct device_node *lan4_phy;
  struct {struct net_device *lan[5];} qm;
  struct phy *sgmii;struct tyfza1_led phy_led;
  bool phy_led_registered,qm_rx,native_groups_created,wifi_started;
@@ -101,7 +117,8 @@ static int rtl_fe_add_port(void *fe,struct net_device *d,int p,int q,int r){
  fe_ports|=BIT(d->lan.port);return 0;
 }
 static void rtl_fe_remove_port(void *fe,struct net_device *d){fe_ports&=~BIT(d->lan.port);}
-static int register_netdev(struct net_device *d){
+static int register_netdevice(struct net_device *d){
+ assert(rtnl_held);
  if(stage==8 && current_port==fail_port)return -EIO;
  assert(d->phydev);active|=BIT(d->lan.port);return 0;
 }
@@ -113,7 +130,7 @@ static int tyfza1_led_register(struct device *d,struct tyfza1_led *l,void *n){re
 static void tyfza1_led_unregister(struct tyfza1_led *l){}
 static void *rtl_phy_led_output;
 '''
-code = shim + '\n'.join(function(n) for n in ('rtl_unregister_lan', 'rtl_sgmii_power_off', 'rtl_register_lan', 'rtl_register_lans'))
+code = shim + '\n'.join(function(n) for n in ('rtl_unregister_lan', 'rtl_sgmii_power_off', 'rtl_register_lan', 'rtl_lan4_work', 'rtl_register_lans'))
 # Run the actual post-registration probe block independently of shared DMA setup.
 probe = function('rtl_probe')
 services = probe[probe.index('\tret = sysfs_create_groups('):probe.index('\tschedule_delayed_work(')]
@@ -135,13 +152,19 @@ int main(void){
   struct device parent={0};
   active=removed=fe_ports=allocated=power=actions=node_refs=0;
   for(int p=0;p<5;p++)nodes[p].port=p;
+  init_completion(&priv.lan4_ready);
   rtl_register_lans(&priv,&parent);
+  if(priv.lan4_phy){
+   assert(!priv.lan4_ready.done && !(active&BIT(4)));
+   flush_work(&priv.lan4_work);
+  }
   unsigned int expected=(1U<<board_ports)-1;
   if(board_ports==5)expected&=~BIT(3);
   if(stage>=1 && stage<=3 && board_ports==5)expected&=~BIT(4);
   if(stage>=4 && stage<=8 && !(stage==4 && fail_port==0))expected&=~BIT(fail_port);
   assert(active==expected && priv.registered_ports==expected && fe_ports==expected);
   assert(!removed && !node_refs);
+  assert(priv.lan4_ready.done && !!priv.lan4_phy==(board_ports==5));
   for(int p=0;p<board_ports;p++){
    assert(!!priv.ports[p]==!!(expected&BIT(p)));
    assert(priv.qm.lan[p]==priv.ports[p]);
@@ -170,10 +193,11 @@ int main(void){
 code = code.replace('bool phy_led_registered,qm_rx,native_groups_created,wifi_started;', 'bool phy_led_registered,qm_rx,dma_tx,native_groups_created,wifi_started;')
 # The production code uses the device kobject only as a sysfs API argument.
 code = code.replace('struct device {struct device_node *of_node;};', 'struct device {struct device_node *of_node;int kobj;};')
-with tempfile.TemporaryDirectory(prefix='lan-isolation-') as directory:
-    path = Path(directory)
-    (path / 'test.c').write_text(code)
-    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
-                    '-Wno-unused-parameter', '-Wno-sign-compare',
-                    str(path / 'test.c'), '-o', str(path / 'test')], check=True)
-    subprocess.run([str(path / 'test')], check=True)
+if __name__ == '__main__':
+    with tempfile.TemporaryDirectory(prefix='lan-isolation-') as directory:
+        path = Path(directory)
+        (path / 'test.c').write_text(code)
+        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                        '-Wno-unused-parameter', '-Wno-sign-compare',
+                        str(path / 'test.c'), '-o', str(path / 'test')], check=True)
+        subprocess.run([str(path / 'test')], check=True)

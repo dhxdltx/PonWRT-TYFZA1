@@ -101,7 +101,7 @@ static const unsigned int fe_registers[] = {
  0x3278,0x327c,0x3280,
  0x3500,0x3504,0x351c,
  0x3940,0x3944,0x3948,0x3c80,
- 0x3508,0x30cc,0x30a4,
+ 0x3508,0x30cc,0x30a4,0x3218,
 };
 struct rtl_fe {
  struct device *device;
@@ -226,6 +226,8 @@ static int fe_prepare(struct rtl_fe *fe)
   }
  }
  fe->prepared=true;
+ /* Original aal_l3fe_l4_chksum: EPP checksum status requires this engine. */
+ fe_write(fe,0x3218,fe_read(fe,0x3218)|BIT(16));
  /* Keep GEM rewriting disabled until its classifier/default chain is ready. */
  fe_write(fe,0x351c,fe_read(fe,0x351c)&~BIT(10));
  /* The inherited IPPB maps source18 to port4. Preserve the Wi-Fi descriptor's
@@ -751,13 +753,13 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
  data->input=port;
  data->key=(struct rtl_fe_ipv4_key){
   .source_port=ntohs(ports.key->src),.destination_port=ntohs(ports.key->dst),
-  .protocol=basic.key->ip_proto,.ingress=port->source,.llid=port->llid,.mask=63};
+  .protocol=basic.key->ip_proto,.ingress=port->source,.llid=port->llid,.mask=port->wifi_id?62:63};
  if(data->ipv6) {
   if(!flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_IPV6_ADDRS))return -EOPNOTSUPP;
   flow_rule_match_ipv6_addrs(rule,&addresses6);
   data->key6=(struct rtl_fe_ipv6_key){.source_port=data->key.source_port,
    .destination_port=data->key.destination_port,.protocol=data->key.protocol,
-   .ingress=data->key.ingress,.llid=data->key.llid,.mask=63};
+   .ingress=data->key.ingress,.llid=data->key.llid,.mask=data->key.mask};
   for(i=0;i<4;i++) {
    if(addresses6.mask->src.s6_addr32[i]!=htonl(~0U) ||
       addresses6.mask->dst.s6_addr32[i]!=htonl(~0U))return -EOPNOTSUPP;
@@ -1254,10 +1256,11 @@ int rtl_fe_add_wifi_port(struct rtl_fe *fe,struct net_device *netdev,unsigned in
 
  mutex_lock(&fe->lock);
  port=fe_port(fe,netdev);
- if(port)port->wifi_id=id;
+ /* Wi-Fi DMA puts its interface ID in both POL_ID and metadata low8. */
+ if(port){port->wifi_id=id;port->llid=id;}
  mutex_unlock(&fe->lock);
  if(port)return 0;
- ret=rtl_fe_add_port(fe,netdev,RTL_WIFI_SOURCE,16,0);
+ ret=rtl_fe_add_port(fe,netdev,RTL_WIFI_SOURCE,16,id);
  if(ret)return ret;
  mutex_lock(&fe->lock);
  fe_port(fe,netdev)->wifi_id=id;

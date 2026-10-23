@@ -10,12 +10,15 @@ test "$(git -C "$TREE" rev-parse HEAD)" = "$PIN" || {
     echo "OpenWrt HEAD differs from sources.lock.json" >&2
     exit 1
 }
+sh "$PORT/scripts/apply-openwrt-patches.sh" "$TREE"
 mkdir -p "$TREE/target/linux/rtl9617c"
 rsync -a --delete "$PORT/overlay/target/linux/rtl9617c/" "$TREE/target/linux/rtl9617c/"
 mkdir -p "$TREE/package/luci-app-tyfza1-pon"
 rsync -a --delete "$PORT/packages/luci-app-tyfza1-pon/" "$TREE/package/luci-app-tyfza1-pon/"
 mkdir -p "$TREE/package/tyfza1-pon-control"
 rsync -a --delete "$PORT/packages/tyfza1-pon-control/" "$TREE/package/tyfza1-pon-control/"
+mkdir -p "$TREE/package/tyfza1-storage"
+rsync -a --delete "$PORT/packages/tyfza1-storage/" "$TREE/package/tyfza1-storage/"
 # hostapd patches apply to its unpacked source, not the OpenWrt tree root.
 cp "$PORT/host-patches/471-hostapd-acs-no-survey.patch" \
     "$TREE/package/network/services/hostapd/patches/471-hostapd-acs-no-survey.patch"

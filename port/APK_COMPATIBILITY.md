@@ -1,10 +1,17 @@
-# Official package compatibility on TYFZA1
+# A53 package compatibility on TYFZA1
 
 The firmware uses only OpenWrt's signed A53 snapshot userspace feeds: base,
 luci, packages, routing, telephony and video. It keeps A55 code generation and
 the `aarch64_cortex-a55` primary APK architecture, adding
 `aarch64_cortex-a53` as a compatible architecture on first boot and upgrades.
 No alternate target's kernel repository or project package repository is added.
+
+This is a default feed selection, not a source whitelist. Cortex-A55 runs A53
+userspace binaries directly. APK accepts `aarch64_cortex-a53` packages from
+official feeds, third-party feeds and local files, as well as `noarch` packages.
+There is no TYFZA1 patch to APK or the LuCI package manager restricting package
+origins. A55 remains the compilation target for this board's own code; there is
+no need to relabel A55 binaries as A53 to install A53 applications.
 
 `openwrt-keyring` supplies the official snapshot signing key, and `ca-bundle`
 supplies HTTPS trust. The first-boot migration checks that the signing key is
@@ -56,6 +63,22 @@ kernel ABI and included in the firmware. A plugin requiring a different
 hardware driver or an unselected kernel subsystem may still need a new image.
 Future snapshot packages can also introduce new runtime requirements. Firmware
 upgrades use this project's sysupgrade images.
+
+## Third-party packages
+
+For a signed third-party APK repository, install the publisher's authenticated
+APK public key under `/etc/apk/keys/` and put its repository URL in
+`/etc/apk/repositories.d/customfeeds.list`. Then use normal `apk update` and
+`apk add`. Do not replace the official key or the official feeds.
+
+For a local package whose signing key is already trusted:
+
+```sh
+apk add /tmp/example.apk
+```
+
+The firmware uses APK. Install `.apk` packages and use the publisher's signing
+key for third-party repositories.
 
 ## Verification scope
 

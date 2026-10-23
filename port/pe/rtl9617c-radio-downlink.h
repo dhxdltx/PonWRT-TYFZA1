@@ -19,13 +19,14 @@ static void __attribute__((noinline)) ni_peer_event(volatile u32 *mailbox, u8 *m
 {
 	u32 mask = 0;
 	if (*(u32 *)(memory + 0xe800 + macid * 16))
+#pragma clang loop unroll(disable)
 		for (u32 tid = 0; tid < 8; tid++)
 			if (*(u32 *)(memory + NI_TID_PENDING + (macid * 8 + tid) * 4)) mask |= BIT(tid);
 	u32 *old = (void *)(memory + NI_TIM_MASK + macid * 4);
 	if (*old != mask) { *old = mask; pe_event(mailbox); }
 }
 
-/* Queue metadata uses the 32-byte NI BID headroom, before HEADER_A.
+/* Queue metadata uses the NI BID headroom, before HEADER_A.
  * Hardware WP ownership starts only when a queued frame is selected. */
 static void ni_peer_add(volatile u32 *mailbox, u8 *memory, u32 macid)
 {
@@ -39,7 +40,7 @@ static void ni_peer_add(volatile u32 *mailbox, u8 *memory, u32 macid)
 	}
 }
 
-static void __attribute__((section(".rxq"), noinline)) ni_enqueue(
+static void __attribute__((noinline)) ni_enqueue(
 	volatile u32 *mailbox, u8 *memory, u32 queue, u32 head, u32 tail, u32 count)
 {
 	u32 macid = queue >> 3, *old_tail = (void *)(memory + NI_TID_TAIL + queue * 4);
@@ -71,6 +72,7 @@ static u32 __attribute__((section(".rxq"), noinline)) ni_ingest(volatile u32 *ma
 	u32 producer = ni[mailbox[114] / 4 + cos] & mask;
 	if (producer == consumer) return 0;
 	u32 count = 0, group = 0, head = 0, tail = 0, grouped = 0;
+	u32 cached_peer = 0, cached_low = 0, cached_high = 0;
 	u32 fence = mailbox[171] & BIT(cos);
 	u32 target = *(u32 *)(memory + NI_EPP_RETIRE_TARGETS + cos * 4), crossed = 0;
 	sync();
@@ -78,31 +80,41 @@ static u32 __attribute__((section(".rxq"), noinline)) ni_ingest(volatile u32 *ma
 		const u32 *entry = uncached(mailbox[25] + (cos << shift) + consumer);
 		if ((*(volatile u32 *)entry & 0x50) != 0x50) break;
 		u32 buffer = entry[0] & 0xffffff80, header, length = ni_length(entry, buffer, &header);
-		u8 *ethernet = uncached(buffer + 32 + header);
+		u8 *ethernet = uncached(buffer + RTL_QM_HEADROOM + header);
 		u32 macid = 0;
-		if (length >= 14 && length <= 2048 - 32 - header)
-			for (u32 peer = 1; peer < 128; peer++) {
-				if (!*(u32 *)(memory + NI_PEER_ROUTE + peer * 4)) continue;
-				/* Both NI Ethernet and the eight-byte peer slot are word aligned.
-				 * Compare six bytes without MIPS packed/byte DDR transactions. */
-				const u32 *address = (const void *)(memory + 0xe400 + peer * 8);
-				const u32 *destination = (const void *)ethernet;
-				if (address[0] == destination[0] && !((address[1] ^ destination[1]) & 65535)) {
-					macid = peer; break;
+		if (length >= 14 && length <= RTL_QM_DATA_BYTES - header) {
+			const u32 *destination = (const void *)ethernet;
+			u32 low = destination[0], high = destination[1] & 65535;
+			/* Cache only this batch's destination; admission can be revoked
+			 * asynchronously and must still be checked for every packet. */
+			if (cached_peer && low == cached_low && high == cached_high &&
+			    *(volatile u32 *)(memory + NI_PEER_ROUTE + cached_peer * 4))
+				macid = cached_peer;
+			else {
+				for (u32 peer = 1; peer < 128; peer++) {
+					if (!*(u32 *)(memory + NI_PEER_ROUTE + peer * 4)) continue;
+					const u32 *address = (const void *)(memory + 0xe400 + peer * 8);
+					if (address[0] == low && (address[1] & 65535) == high) {
+						macid = peer; break;
+					}
 				}
+				cached_peer = macid; cached_low = low; cached_high = high;
 			}
+		}
 		if (!macid) {
 			mailbox[128] = entry[0]; mailbox[129] = entry[1];
 			mailbox[130] = length; mailbox[131] = header;
 			mailbox[132] = big_word(ethernet); mailbox[133] = big_word(ethernet + 4); mailbox[40]++;
 		}
-		u32 tid = macid ? big_word(uncached(buffer + 36)) & 7 : 0, queue = macid * 8 + tid;
+		u32 tid = macid ? big_word(uncached(buffer + RTL_QM_HEADROOM + 4)) & 7 : 0, queue = macid * 8 + tid;
 		/* Link BIDs locally; update the shared peer/TID counts once per group. */
 		if (grouped && queue != group) {
 			ni_enqueue(mailbox, memory, group, head, tail, grouped); grouped = 0;
 		}
 		u32 *waiting = uncached(buffer);
-		waiting[0] = buffer + 32 + header; waiting[1] = length; waiting[2] = macid; waiting[3] = tid;
+		/* The BID already identifies the payload; only length/header and
+		 * the queue link need storage. Word0 remains the selected MPDU chain. */
+		waiting[1] = length | header << 16; waiting[3] = tid;
 		if (grouped) *(u32 *)uncached(tail + 12) = buffer | tid;
 		else { head = buffer; group = queue; }
 		tail = buffer; grouped++;
@@ -160,12 +172,14 @@ static u32 __attribute__((section(".rxq"), noinline)) ni_select(volatile u32 *ma
 				owners[id * 2 + 1] |= BIT(31);
 				mailbox[47] = id + 1; mailbox[63]++;
 			} else {
+				u32 metadata = waiting[1], length = metadata & 65535;
+#pragma clang loop unroll(disable)
 				for (u32 i = 0; i < 8; i++) request[i] = peer[i];
 				request[0] = 256 + id; request[1] = channels[tid];
-				request[2] = BIT(24) | (peer[2] & 0x3f0000) | (waiting[1] + ((peer[2] >> 16) & 63) + 8 - 14);
+				request[2] = BIT(24) | (peer[2] & 0x3f0000) | (length + ((peer[2] >> 16) & 63) + 8 - 14);
 				request[4] = (peer[4] & ~0x1fffU) | tid | indicators[tid] << 12;
 				request[5] = (peer[5] & ~255U) | *(u32 *)(memory + NI_PEER_BA + (macid * 8 + tid) * 4);
-				request[8] = waiting[0]; request[9] = waiting[1];
+				request[8] = buffer + RTL_QM_HEADROOM + (metadata >> 16); request[9] = length;
 				u32 caps = *(u32 *)(memory + 0xe200 + macid * 4);
 				if (caps & BIT(17)) request[3] |= BIT(20);
 				if (ps[0]) {
@@ -174,13 +188,15 @@ static u32 __attribute__((section(".rxq"), noinline)) ni_select(volatile u32 *ma
 					ps[2] = ps[1]; mailbox[39]++;
 				} else {
 					ps[2] = ps[1];
-					u32 next = waiting[3] & ~127U, body = waiting[1] + 8;
+					u32 next = waiting[3] & ~127U, body = length + 8;
 					if (((request[2] >> 16) & 63) == 26 && !(request[3] & BIT(19))) {
 						while (next && frames < 8) {
 							u32 *part = uncached(next), pad = (0U - body) & 3;
-							if (body + pad + part[1] + 8 > (caps >> 18)) break;
-							request[8 + frames * 2] = part[0]; request[9 + frames * 2] = part[1];
-							body += pad + part[1] + 8;
+							u32 next_metadata = part[1], next_length = next_metadata & 65535;
+							if (body + pad + next_length + 8 > (caps >> 18)) break;
+							request[8 + frames * 2] = next + RTL_QM_HEADROOM + (next_metadata >> 16);
+							request[9 + frames * 2] = next_length;
+							body += pad + next_length + 8;
 							*(u32 *)uncached(tail_buffer) = next;
 							tail_buffer = next; next = part[3] & ~127U; frames++;
 						}
