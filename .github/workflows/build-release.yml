@@ -112,6 +112,7 @@ jobs:
           fi
           openssl req -new -x509 -key artifacts/signing/dev.key \
             -out artifacts/signing/dev.crt -subj /CN=TYFZA1-FIT -days 3650
+
       - name: Build OpenWrt and native PE
         shell: bash
         env:
