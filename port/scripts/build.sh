@@ -58,7 +58,7 @@ if grep -qi microsoft /proc/sys/kernel/osrelease; then
         make tools/fakeroot/clean
     fi
 fi
-make -j"$JOBS" download
+make -j"$JOBS" download V=s
 if [ -n "${TYFZA1_RUNTIME_INPUTS:-}" ]; then
     python3 "$PROJECT/tools/install_runtime_inputs.py" "$TYFZA1_RUNTIME_INPUTS" "$TREE/files"
 else
