@@ -1,3 +1,10 @@
+## v0.8.11-beta-CFW+DOCKER
+
+### 更新
+
+- 支持Docker。
+- 同步主线0.8.2-beta版本。
+
 ## v0.8.11-beta-CFW
 
 ### 更新
