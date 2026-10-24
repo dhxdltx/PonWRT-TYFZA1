@@ -58,7 +58,7 @@ if grep -qi microsoft /proc/sys/kernel/osrelease; then
         make tools/fakeroot/clean
     fi
 fi
-make -j"$JOBS" download V=s
+make -j"$JOBS" download
 if [ -n "${TYFZA1_RUNTIME_INPUTS:-}" ]; then
     python3 "$PROJECT/tools/install_runtime_inputs.py" "$TYFZA1_RUNTIME_INPUTS" "$TREE/files"
 else
@@ -66,4 +66,4 @@ else
         --stock "${TYFZA1_STOCK_INPUTS:-$PROJECT/analysis/private/live-files}"
     python3 "$PROJECT/tools/prepare_wifi_runtime.py" "$TREE/files" --openwrt-tree "$TREE"
 fi
-make -j"$JOBS" world
+make -j"$JOBS" world -j1 V=s
