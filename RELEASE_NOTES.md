@@ -2,9 +2,11 @@
 ### 更新
 
 - 修复docker联网问题。
+- 增加rtp2httpd。
 - 同步主线0.8.2-beta版本。
 - 超过32MB的包体刷入前需先刷入EXTTEST中间包，然后sysupgrade。
 - 改变命名规则，之后无DOCKER包为CFW，带DOCKER为CFW2，中间包为EXT(如果之后还需要）.
+- 自用测试！不保证可用！请不要分发该release下固件。
 
 ## v0.8.11-beta-CFW+DOCKER
 
